@@ -1,0 +1,29 @@
+﻿# Dependencies
+node_modules/
+
+# Environment variables (NEVER commit real keys)
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+build/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor/OS
+.DS_Store
+.vscode/
+*.bak-*
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local Claude/Cursor config
+.claude/
