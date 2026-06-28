@@ -36,6 +36,86 @@ const PELICAN_CONFIG = {
   cleaning: "Lemon Fresh Cleaning",
 };
 
+function getActiveReservation(session) {
+  if (!session?.reservations?.length) return null;
+  const item =
+    session.reservations.find((r) => r.id === session.default_reservation_id) ||
+    session.reservations[0];
+  if (!item) return null;
+  return {
+    ...item,
+    guest_name: session.guest_name,
+    email: session.email,
+  };
+}
+
+function isSupportedGuestSession(session) {
+  const active = getActiveReservation(session);
+  return Boolean(active?.unit && PELICAN_ALLOWED_UNITS.includes(active.unit));
+}
+
+function normalizeGuestSessionForCompare(session) {
+  return {
+    guest_name: session.guest_name,
+    email: session.email,
+    default_reservation_id: session.default_reservation_id,
+    reservations: [...session.reservations]
+      .sort((a, b) => a.id - b.id)
+      .map((r) => ({
+        id: r.id,
+        unit: r.unit,
+        property_name: r.property_name,
+        check_in: r.check_in,
+        check_out: r.check_out,
+        door_code: r.door_code,
+        stay_phase: r.stay_phase,
+        num_guests: r.num_guests,
+      })),
+  };
+}
+
+function guestSessionsEqual(a, b) {
+  if (!a || !b) return false;
+  return (
+    JSON.stringify(normalizeGuestSessionForCompare(a)) ===
+    JSON.stringify(normalizeGuestSessionForCompare(b))
+  );
+}
+
+function readCachedGuestSession() {
+  try {
+    const cached = localStorage.getItem(RESERVATION_CACHE_KEY);
+    if (!cached) return null;
+    const parsed = JSON.parse(cached);
+    if (Array.isArray(parsed.reservations) && isSupportedGuestSession(parsed)) {
+      return parsed;
+    }
+    localStorage.removeItem(RESERVATION_CACHE_KEY);
+  } catch {
+    localStorage.removeItem(RESERVATION_CACHE_KEY);
+  }
+  return null;
+}
+
+async function refreshGuestSession(email) {
+  const normalized = (email || "").trim().toLowerCase();
+  if (!normalized || !GUEST_API_KEY) return null;
+  try {
+    const res = await fetch(
+      `/api/guest/reservation?email=${encodeURIComponent(normalized)}`,
+      { headers: { "X-Guest-API-Key": GUEST_API_KEY } },
+    );
+    if (res.status === 404) return { revoked: true };
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!Array.isArray(data.reservations) || !data.reservations.length) return { revoked: true };
+    if (!isSupportedGuestSession(data)) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchReservation(email) {
   const normalized = email.trim().toLowerCase();
   if (!normalized) throw new Error(LOGIN_ERROR);
@@ -46,10 +126,13 @@ async function fetchReservation(email) {
     );
     if (!res.ok) throw new Error(LOGIN_ERROR);
     const data = await res.json();
-    if (!PELICAN_ALLOWED_UNITS.includes(data.unit)) {
+    if (!Array.isArray(data.reservations) || !data.reservations.length) {
       throw new Error(LOGIN_ERROR);
     }
-    return { ...data, email: normalized };
+    if (!isSupportedGuestSession(data)) {
+      throw new Error(LOGIN_ERROR);
+    }
+    return data;
   } catch (err) {
     if (err.message === LOGIN_ERROR) throw err;
     throw new Error(LOGIN_ERROR);
@@ -70,7 +153,17 @@ function checkOutAtFromDate(checkOut) {
 
 function formatDisplayDate(isoDate) {
   const d = new Date(`${isoDate}T12:00:00`);
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function getPreviousStays(guestSession) {
+  if (!guestSession?.reservations?.length) return [];
+  return guestSession.reservations.filter((r) => r.stay_phase === "past");
+}
+
+function formatStayDateRange(checkIn, checkOut) {
+  if (!checkIn || !checkOut) return "—";
+  return `${formatDisplayDate(checkIn)} – ${formatDisplayDate(checkOut)}`;
 }
 
 function displayUnitNumber(unit) {
@@ -444,7 +537,7 @@ function StayTab({ reservation, property }) {
             <DateBox label="Check-out" date={property.checkOut.date} time={property.checkOut.time} right />
           </div>
           <div style={{ display: "flex", gap: 16, marginTop: 8, paddingTop: 12, borderTop: "1px solid #f3f4f6" }}>
-            {[["👥", property.guests, "Guests"], ["🛏", property.bedrooms, "Bedrooms"], ["🚿", property.bathrooms, "Bathrooms"]].map(([icon, val, label]) => (
+            {[["👥", reservation.num_guests, "Guests"], ["🛏", property.bedrooms, "Bedrooms"], ["🚿", property.bathrooms, "Bathrooms"]].map(([icon, val, label]) => (
               <div key={label} style={{ textAlign: "center", flex: 1 }}>
                 <div style={{ fontSize: 13, fontWeight: 600, color: "#1a1a2e" }}>{icon} {val}</div>
                 <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 2 }}>{label}</div>
@@ -1021,7 +1114,7 @@ function RebookPaymentForm({ paymentIntentId, onSuccess, onError }) {
   );
 }
 
-function RebookTab({ reservation, property }) {
+function RebookTab({ reservation, property, guestSession }) {
   const [checkIn, setCheckIn] = useState("2027-06-20");
   const [step, setStep] = useState("intro");
   const [loading, setLoading] = useState(false);
@@ -1168,7 +1261,37 @@ function RebookTab({ reservation, property }) {
       )}
 
       <p style={{ textAlign: "center", fontSize: 12, color: "#9ca3af", marginTop: 10 }}>🔒 Secure payment via Stripe · test mode in development</p>
+      <PreviousStaysSection guestSession={guestSession} />
     </div>
+  );
+}
+
+function PreviousStaysSection({ guestSession }) {
+  const pastStays = getPreviousStays(guestSession);
+  if (pastStays.length === 0) return null;
+
+  return (
+    <Card>
+      <SectionLabel>Previous Stays</SectionLabel>
+      <div style={{ marginTop: 8 }}>
+        {pastStays.map((stay, i) => (
+          <div
+            key={stay.id}
+            style={{
+              padding: "10px 0",
+              borderBottom: i < pastStays.length - 1 ? "1px solid #f3f4f6" : "none",
+            }}
+          >
+            <div style={{ fontSize: 14, fontWeight: 600, color: "#1a1a2e" }}>
+              Condo# {displayUnitNumber(stay.unit)}
+            </div>
+            <div style={{ fontSize: 13, color: "#6b7280", marginTop: 2 }}>
+              {formatStayDateRange(stay.check_in, stay.check_out)}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 
@@ -1289,28 +1412,45 @@ function LoginScreen({ onLogin }) {
 
 // ─── APP SHELL ────────────────────────────────────────────────────────────────
 export default function App() {
-  const [reservation, setReservation] = useState(null);
+  const [guestSession, setGuestSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [tab, setTab] = useState("stay");
 
+  const reservation = guestSession ? getActiveReservation(guestSession) : null;
+
   useEffect(() => {
-    try {
-      const cached = localStorage.getItem(RESERVATION_CACHE_KEY);
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (PELICAN_ALLOWED_UNITS.includes(parsed.unit)) setReservation(parsed);
-        else localStorage.removeItem(RESERVATION_CACHE_KEY);
-      }
-    } catch {
-      localStorage.removeItem(RESERVATION_CACHE_KEY);
+    const cached = readCachedGuestSession();
+    if (cached) {
+      setGuestSession(cached);
     }
     setAuthLoading(false);
+
+    if (!cached?.email) return undefined;
+
+    let cancelled = false;
+    refreshGuestSession(cached.email).then((fresh) => {
+      if (cancelled) return;
+      if (fresh?.revoked) {
+        localStorage.removeItem(RESERVATION_CACHE_KEY);
+        setGuestSession(null);
+        return;
+      }
+      if (!fresh) return;
+      if (!guestSessionsEqual(cached, fresh)) {
+        setGuestSession(fresh);
+        localStorage.setItem(RESERVATION_CACHE_KEY, JSON.stringify(fresh));
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const login = async (email) => {
-    const data = await fetchReservation(email);
-    setReservation(data);
-    localStorage.setItem(RESERVATION_CACHE_KEY, JSON.stringify(data));
+    const session = await fetchReservation(email);
+    setGuestSession(session);
+    localStorage.setItem(RESERVATION_CACHE_KEY, JSON.stringify(session));
   };
 
   if (authLoading) {
@@ -1342,7 +1482,7 @@ export default function App() {
         <div style={{ display: tab === "guide" ? "flex" : "none", flexDirection: "column", height: "100%" }}><GuideTab reservation={reservation} property={property} /></div>
         <div style={{ display: tab === "contact" ? "block" : "none", height: "100%" }}><ContactTab reservation={reservation} property={property} /></div>
         <div style={{ display: tab === "sunny" ? "flex" : "none", flexDirection: "column", height: "100%" }}><SunnyTab reservation={reservation} property={property} /></div>
-        <div style={{ display: tab === "rebook" ? "block" : "none", height: "100%" }}><RebookTab reservation={reservation} property={property} /></div>
+        <div style={{ display: tab === "rebook" ? "block" : "none", height: "100%" }}><RebookTab reservation={reservation} property={property} guestSession={guestSession} /></div>
       </div>
 
       {/* Bottom Nav (colored / filled) */}
