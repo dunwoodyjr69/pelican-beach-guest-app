@@ -1164,15 +1164,46 @@ function checkInPickAllowed(stayRanges, blockedRanges, key) {
 }
 
 async function fetchUnitAvailability(unit) {
-  if (!unit || !GUEST_API_KEY) return null;
+  const normalizedUnit = (unit || "").trim();
+  if (!normalizedUnit) {
+    console.error("[fetchUnitAvailability] missing unit parameter");
+    return null;
+  }
+  if (!GUEST_API_KEY) {
+    console.error("[fetchUnitAvailability] VITE_GUEST_API_KEY is not configured in this build");
+    return null;
+  }
+
+  const url = `/api/guest/availability?unit=${encodeURIComponent(normalizedUnit)}`;
   try {
-    const res = await fetch(
-      `/api/guest/availability?unit=${encodeURIComponent(unit)}`,
-      { headers: { "X-Guest-API-Key": GUEST_API_KEY } },
-    );
-    if (!res.ok) return null;
+    const res = await fetch(url, {
+      headers: { "X-Guest-API-Key": GUEST_API_KEY },
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.error("[fetchUnitAvailability] HTTP error", {
+        url,
+        status: res.status,
+        statusText: res.statusText,
+        body,
+      });
+      return null;
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      const body = await res.text();
+      console.error("[fetchUnitAvailability] non-JSON response (often a login redirect or SPA fallback)", {
+        url,
+        contentType,
+        bodyPreview: body.slice(0, 200),
+      });
+      return null;
+    }
+
     return await res.json();
-  } catch {
+  } catch (err) {
+    console.error("[fetchUnitAvailability] network or parse error", { url, err });
     return null;
   }
 }
