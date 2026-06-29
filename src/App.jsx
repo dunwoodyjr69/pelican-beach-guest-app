@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { loadStripe } from "@stripe/stripe-js";
 import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
 import lfvSun from "./assets/lfv-sun.png";
@@ -1043,6 +1043,356 @@ function ContactTab({ reservation, property }) {
 }
 
 // ─── REBOOK TAB ───────────────────────────────────────────────────────────────
+const REBOOK_MIN_NIGHTS = 4;
+const REBOOK_DATE_INPUT_STYLE = {
+  width: "100%",
+  padding: "12px",
+  fontSize: 14,
+  border: "1.5px solid #e5e7eb",
+  borderRadius: 10,
+  color: "#1a1a2e",
+  boxSizing: "border-box",
+};
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function todayDateKey() {
+  const n = new Date();
+  return `${n.getFullYear()}-${pad2(n.getMonth() + 1)}-${pad2(n.getDate())}`;
+}
+
+function compareDateKeys(a, b) {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+function addDaysToDateKey(key, days) {
+  const [y, m, d] = key.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + days);
+  return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+}
+
+function nightsBetweenKeys(checkIn, checkOut) {
+  if (!checkIn || !checkOut) return 0;
+  const [iy, im, id] = checkIn.split("-").map(Number);
+  const [oy, om, od] = checkOut.split("-").map(Number);
+  return Math.round((Date.UTC(oy, om - 1, od) - Date.UTC(iy, im - 1, id)) / 86400000);
+}
+
+function normalizeStayRanges(stays) {
+  return (stays || [])
+    .map((stay) => ({
+      checkIn: stay.check_in || stay.checkIn,
+      checkOut: stay.check_out || stay.checkOut,
+    }))
+    .filter((stay) => stay.checkIn && stay.checkOut);
+}
+
+function hasCheckInOnDay(stayRanges, key) {
+  return stayRanges.some((stay) => stay.checkIn === key);
+}
+
+function isInteriorNight(stayRanges, key) {
+  return stayRanges.some(
+    (stay) => compareDateKeys(stay.checkIn, key) < 0 && compareDateKeys(key, stay.checkOut) < 0,
+  );
+}
+
+function isBlockedKey(stayRanges, blockedRanges, key) {
+  for (const range of blockedRanges || []) {
+    if (compareDateKeys(key, range.start) >= 0 && compareDateKeys(key, range.end) <= 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isOccupiedNightForDisplay(stayRanges, blockedRanges, key) {
+  if (isInteriorNight(stayRanges, key)) return true;
+  if (hasCheckInOnDay(stayRanges, key)) return true;
+  if (!stayRanges.length) {
+    for (const range of blockedRanges || []) {
+      const interiorStart = addDaysToDateKey(range.start, 1);
+      if (compareDateKeys(interiorStart, key) <= 0 && compareDateKeys(key, range.end) <= 0) {
+        return true;
+      }
+    }
+  }
+  return isBlockedKey(stayRanges, blockedRanges, key);
+}
+
+function stayRangeIsValid(stayRanges, blockedRanges, checkIn, checkOut) {
+  if (!checkIn || !checkOut || compareDateKeys(checkOut, checkIn) <= 0) return false;
+  let d = checkIn;
+  while (compareDateKeys(d, checkOut) < 0) {
+    if (
+      isBlockedKey(stayRanges, blockedRanges, d) ||
+      isInteriorNight(stayRanges, d) ||
+      hasCheckInOnDay(stayRanges, d)
+    ) {
+      return false;
+    }
+    d = addDaysToDateKey(d, 1);
+  }
+  return true;
+}
+
+function checkOutPickAllowed(stayRanges, blockedRanges, checkIn, checkOutKey) {
+  return stayRangeIsValid(stayRanges, blockedRanges, checkIn, checkOutKey);
+}
+
+function calendarDaySelectable(stayRanges, blockedRanges, key, checkIn, checkOut) {
+  if (compareDateKeys(key, todayDateKey()) < 0) return false;
+  const pickCheckout = !!(checkIn && !checkOut);
+  if (pickCheckout) {
+    return checkOutPickAllowed(stayRanges, blockedRanges, checkIn, key);
+  }
+  if (isBlockedKey(stayRanges, blockedRanges, key)) return false;
+  if (isInteriorNight(stayRanges, key) || hasCheckInOnDay(stayRanges, key)) return false;
+  return true;
+}
+
+function checkInPickAllowed(stayRanges, blockedRanges, key) {
+  if (compareDateKeys(key, todayDateKey()) < 0) return false;
+  if (isBlockedKey(stayRanges, blockedRanges, key)) return false;
+  if (isInteriorNight(stayRanges, key) || hasCheckInOnDay(stayRanges, key)) return false;
+  return true;
+}
+
+async function fetchUnitAvailability(unit) {
+  if (!unit || !GUEST_API_KEY) return null;
+  try {
+    const res = await fetch(
+      `/api/guest/availability?unit=${encodeURIComponent(unit)}`,
+      { headers: { "X-Guest-API-Key": GUEST_API_KEY } },
+    );
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+function RebookDatePicker({ unit, checkIn, checkOut, onChangeDates }) {
+  const [stayRanges, setStayRanges] = useState([]);
+  const [blockedRanges, setBlockedRanges] = useState([]);
+  const [availabilityError, setAvailabilityError] = useState("");
+  const [loadingAvailability, setLoadingAvailability] = useState(true);
+  const [viewYear, setViewYear] = useState(() => new Date().getFullYear());
+  const [viewMonth, setViewMonth] = useState(() => new Date().getMonth());
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingAvailability(true);
+    setAvailabilityError("");
+    fetchUnitAvailability(unit).then((data) => {
+      if (cancelled) return;
+      if (!data) {
+        setAvailabilityError("Could not load availability. Please try again in a moment.");
+        setStayRanges([]);
+        setBlockedRanges([]);
+      } else {
+        setStayRanges(normalizeStayRanges(data.stays));
+        setBlockedRanges(Array.isArray(data.blocked) ? data.blocked : []);
+      }
+      setLoadingAvailability(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [unit]);
+
+  useEffect(() => {
+    if (loadingAvailability) return;
+    if (checkIn && !checkInPickAllowed(stayRanges, blockedRanges, checkIn)) {
+      onChangeDates("", "");
+      return;
+    }
+    if (checkIn && checkOut && !stayRangeIsValid(stayRanges, blockedRanges, checkIn, checkOut)) {
+      onChangeDates(checkIn, "");
+    }
+  }, [loadingAvailability, stayRanges, blockedRanges, checkIn, checkOut, onChangeDates]);
+
+  const handleCheckInChange = (value) => {
+    let nextCheckOut = checkOut;
+    if (value && nextCheckOut && !checkOutPickAllowed(stayRanges, blockedRanges, value, nextCheckOut)) {
+      nextCheckOut = "";
+    }
+    if (value && !checkInPickAllowed(stayRanges, blockedRanges, value)) {
+      onChangeDates("", "");
+      return;
+    }
+    onChangeDates(value, nextCheckOut);
+  };
+
+  const handleCheckOutChange = (value) => {
+    if (!checkIn) {
+      onChangeDates(checkIn, "");
+      return;
+    }
+    if (value && !checkOutPickAllowed(stayRanges, blockedRanges, checkIn, value)) {
+      onChangeDates(checkIn, "");
+      return;
+    }
+    onChangeDates(checkIn, value);
+  };
+
+  const handleCalendarDayClick = (key) => {
+    if (!calendarDaySelectable(stayRanges, blockedRanges, key, checkIn, checkOut)) return;
+    if (!checkIn || (checkIn && checkOut)) {
+      onChangeDates(key, "");
+      return;
+    }
+    if (compareDateKeys(key, checkIn) <= 0) {
+      onChangeDates(key, "");
+      return;
+    }
+    if (checkOutPickAllowed(stayRanges, blockedRanges, checkIn, key)) {
+      onChangeDates(checkIn, key);
+    }
+  };
+
+  const monthNames = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  ];
+  const weekdayLabels = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+  const first = new Date(viewYear, viewMonth, 1);
+  const startPad = first.getDay();
+  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+  const todayKey = todayDateKey();
+
+  const calendarDays = [];
+  for (let p = 0; p < startPad; p += 1) {
+    calendarDays.push({ key: `pad-${p}`, empty: true });
+  }
+  for (let day = 1; day <= daysInMonth; day += 1) {
+    const key = `${viewYear}-${pad2(viewMonth + 1)}-${pad2(day)}`;
+    calendarDays.push({ key, empty: false });
+  }
+
+  const shiftMonth = (delta) => {
+    const d = new Date(viewYear, viewMonth + delta, 1);
+    setViewYear(d.getFullYear());
+    setViewMonth(d.getMonth());
+  };
+
+  return (
+    <div>
+      <p style={{ fontSize: 13, color: "#4b5563", margin: "8px 0 10px" }}>
+        Choose your check-in and checkout dates (minimum {REBOOK_MIN_NIGHTS} nights). Unavailable dates are greyed out on the calendar.
+      </p>
+      <label style={{ display: "block", fontSize: 12, color: "#6b7280", marginBottom: 6 }}>Check-in date</label>
+      <input
+        type="date"
+        value={checkIn}
+        min={todayKey}
+        onChange={(e) => handleCheckInChange(e.target.value)}
+        style={{ ...REBOOK_DATE_INPUT_STYLE, marginBottom: 12 }}
+      />
+      <label style={{ display: "block", fontSize: 12, color: "#6b7280", marginBottom: 6 }}>Checkout date</label>
+      <input
+        type="date"
+        value={checkOut}
+        min={checkIn ? addDaysToDateKey(checkIn, 1) : todayKey}
+        onChange={(e) => handleCheckOutChange(e.target.value)}
+        style={{ ...REBOOK_DATE_INPUT_STYLE, marginBottom: 12 }}
+        disabled={!checkIn}
+      />
+      <div style={{ marginTop: 4 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+          <button
+            type="button"
+            onClick={() => shiftMonth(-1)}
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "4px 10px", cursor: "pointer", color: "#4b5563" }}
+            aria-label="Previous month"
+          >
+            ←
+          </button>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "#1a1a2e" }}>
+            {monthNames[viewMonth]} {viewYear}
+          </div>
+          <button
+            type="button"
+            onClick={() => shiftMonth(1)}
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "4px 10px", cursor: "pointer", color: "#4b5563" }}
+            aria-label="Next month"
+          >
+            →
+          </button>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 4 }}>
+          {weekdayLabels.map((label) => (
+            <div key={label} style={{ fontSize: 11, color: "#9ca3af", textAlign: "center", fontWeight: 600 }}>
+              {label}
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4 }}>
+          {calendarDays.map((day) => {
+            if (day.empty) {
+              return <div key={day.key} aria-hidden="true" />;
+            }
+            const occupied = isOccupiedNightForDisplay(stayRanges, blockedRanges, day.key);
+            const past = compareDateKeys(day.key, todayKey) < 0;
+            const selectable = !past && calendarDaySelectable(stayRanges, blockedRanges, day.key, checkIn, checkOut);
+            const inRange =
+              checkIn &&
+              checkOut &&
+              compareDateKeys(day.key, checkIn) >= 0 &&
+              compareDateKeys(day.key, checkOut) < 0;
+            const isStart = day.key === checkIn;
+            const isEnd = day.key === checkOut;
+            let background = "#fff";
+            let color = "#1a1a2e";
+            if (occupied || past) {
+              background = "#e5e7eb";
+              color = "#9ca3af";
+            } else if (isStart || isEnd) {
+              background = "#0ea5b7";
+              color = "#fff";
+            } else if (inRange) {
+              background = "#cffafe";
+              color = "#0f766e";
+            }
+            return (
+              <button
+                key={day.key}
+                type="button"
+                disabled={!selectable || loadingAvailability}
+                onClick={() => handleCalendarDayClick(day.key)}
+                style={{
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 8,
+                  padding: "8px 0",
+                  fontSize: 13,
+                  fontWeight: isStart || isEnd ? 700 : 500,
+                  background,
+                  color,
+                  cursor: selectable && !loadingAvailability ? "pointer" : "default",
+                  opacity: loadingAvailability ? 0.6 : 1,
+                }}
+              >
+                {Number(day.key.split("-")[2])}
+              </button>
+            );
+          })}
+        </div>
+        {loadingAvailability && (
+          <p style={{ fontSize: 12, color: "#6b7280", marginTop: 8, textAlign: "center" }}>Loading availability…</p>
+        )}
+        {availabilityError && (
+          <p style={{ fontSize: 12, color: "#b45309", marginTop: 8, textAlign: "center" }}>{availabilityError}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function RebookPaymentForm({ paymentIntentId, onSuccess, onError }) {
   const stripe = useStripe();
   const elements = useElements();
@@ -1115,7 +1465,8 @@ function RebookPaymentForm({ paymentIntentId, onSuccess, onError }) {
 }
 
 function RebookTab({ reservation, property, guestSession }) {
-  const [checkIn, setCheckIn] = useState("2027-06-20");
+  const [checkIn, setCheckIn] = useState("");
+  const [checkOut, setCheckOut] = useState("");
   const [step, setStep] = useState("intro");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -1124,8 +1475,22 @@ function RebookTab({ reservation, property, guestSession }) {
   const [paymentIntentId, setPaymentIntentId] = useState(null);
   const [holdSummary, setHoldSummary] = useState(null);
 
+  const nights = nightsBetweenKeys(checkIn, checkOut);
+  const belowMinStay = checkIn && checkOut && nights > 0 && nights < REBOOK_MIN_NIGHTS;
+  const canHold =
+    checkIn &&
+    checkOut &&
+    nights >= REBOOK_MIN_NIGHTS &&
+    !belowMinStay;
+
+  const handleDateChange = useCallback((nextCheckIn, nextCheckOut) => {
+    setCheckIn(nextCheckIn);
+    setCheckOut(nextCheckOut);
+  }, []);
+
   const startHold = async () => {
     setError("");
+    if (!canHold) return;
     if (!GUEST_API_KEY) {
       setError("Guest API is not configured for this build.");
       return;
@@ -1142,6 +1507,7 @@ function RebookTab({ reservation, property, guestSession }) {
           email: reservation.email,
           property: reservation.unit,
           check_in: checkIn,
+          check_out: checkOut,
         }),
       });
       const data = await res.json();
@@ -1208,14 +1574,18 @@ function RebookTab({ reservation, property, guestSession }) {
         <>
           <Card>
             <SectionLabel>Your week</SectionLabel>
-            <p style={{ fontSize: 13, color: "#4b5563", margin: "8px 0 10px" }}>You loved {property.name} — want it again?</p>
-            <label style={{ display: "block", fontSize: 12, color: "#6b7280", marginBottom: 6 }}>Check-in date (7-night stay)</label>
-            <input
-              type="date"
-              value={checkIn}
-              onChange={(e) => setCheckIn(e.target.value)}
-              style={{ width: "100%", padding: "12px", fontSize: 14, border: "1.5px solid #e5e7eb", borderRadius: 10, color: "#1a1a2e", boxSizing: "border-box" }}
+            <p style={{ fontSize: 13, color: "#4b5563", margin: "8px 0 0" }}>You loved {property.name} — want it again?</p>
+            <RebookDatePicker
+              unit={reservation.unit}
+              checkIn={checkIn}
+              checkOut={checkOut}
+              onChangeDates={handleDateChange}
             />
+            {belowMinStay && (
+              <p style={{ fontSize: 13, color: "#b45309", margin: "10px 0 0" }}>
+                Minimum stay is {REBOOK_MIN_NIGHTS} nights.
+              </p>
+            )}
           </Card>
           {error && (
             <div style={{ marginBottom: 12, padding: "12px 14px", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 10, fontSize: 13, color: "#b91c1c" }}>
@@ -1224,11 +1594,24 @@ function RebookTab({ reservation, property, guestSession }) {
           )}
           <button
             onClick={startHold}
-            disabled={loading}
-            style={{ width: "100%", padding: "14px", borderRadius: 12, border: "none", background: loading ? "#94a3b8" : "#0ea5b7", color: "#fff", fontSize: 16, fontWeight: 600, cursor: loading ? "default" : "pointer" }}
+            disabled={loading || !canHold}
+            style={{ width: "100%", padding: "14px", borderRadius: 12, border: "none", background: loading || !canHold ? "#94a3b8" : "#0ea5b7", color: "#fff", fontSize: 16, fontWeight: 600, cursor: loading || !canHold ? "default" : "pointer" }}
           >
             {loading ? "Preparing checkout…" : "Hold my week — $100 deposit"}
           </button>
+          <div style={{ textAlign: "center", marginTop: "16px" }}>
+            <p style={{ fontSize: "14px", color: "#555", margin: 0 }}>
+              Want to see our other condos?{" "}
+              <a
+                href="https://www.lforv.com"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "#0d9488", fontWeight: 600, textDecoration: "underline" }}
+              >
+                Click here for our website
+              </a>
+            </p>
+          </div>
         </>
       )}
 
